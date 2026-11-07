@@ -991,6 +991,25 @@ def groq_summary(stocks_data: list, groq_key: str) -> str:
     except Exception as e:
         return f"Groq 呼叫失敗：{str(e)}"
 
+def groq_run_prompt(prompt: str, groq_key: str, max_tokens: int = 1800) -> str:
+    """用 Groq 直接執行任意 Prompt（供全分析總結使用）。"""
+    if not groq_key:
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": max_tokens, "temperature": 0.5},
+            timeout=45,
+        )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+        return f"Groq API 錯誤：{resp.status_code}"
+    except Exception as e:
+        return f"Groq 呼叫失敗：{str(e)}"
+
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_telegram(token: str, chat_id: str, message: str):
     try:
@@ -3170,6 +3189,169 @@ def render_ai_prompt_buttons(d: dict, sc: dict):
         st.caption("☝️ 全選複製後貼到對應 AI 網頁即可")
 
 
+# ── MASTER AI SUMMARY PROMPT (所有分析結果總結) ───────────────────────────────
+def build_master_prompt(stocks_data: list, ai_name: str = "Claude", compact: bool = False) -> str:
+    """把所有分頁的分析結果（估值、對比、工具箱、爆升前兆、盈利驚喜）
+    匯總成一份可直接餵給 AI 的總結 Prompt。"""
+    valid = [d for d in stocks_data if not d.get("error")]
+    if not valid:
+        return ""
+
+    def fp(v, dec=1): return f"{v:.{dec}f}" if isinstance(v, (int, float)) else "N/A"
+    def fpc(v):       return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "N/A"
+
+    # 工具箱參數（讀取使用者在 Tab3 設定的滑桿，沒有則用預設）
+    rf     = st.session_state.get("rf_slider", 4.5)
+    erp    = st.session_state.get("erp_slider", 5.0)
+    req    = st.session_state.get("mos_req", 10)
+    growth = st.session_state.get("mos_growth", 12)
+    years  = st.session_state.get("mos_years", 10)
+    fair_pe = fed_adjusted_pe(rf, erp)
+
+    rows, ranked = [], []
+    for d in valid:
+        sc   = score_stock(d)
+        ss   = signal_strength(d, sc)
+        band = get_pe_band(d.get("hist_pe", []))
+        sector = d.get("sector", "default")
+        bench_pe = INDUSTRY_PE.get(sector, INDUSTRY_PE["default"])
+        price, eps, pe = d.get("price"), d.get("eps"), d.get("pe")
+
+        fair = margin_of_safety(eps, req, growth, years) if eps and eps > 0 else 0
+        mos_txt = "N/A"
+        if fair > 0 and isinstance(price, (int, float)):
+            mos_txt = f"合理價${fair:,.0f}（現價{(price-fair)/fair*100:+.1f}%）"
+
+        pe_vs_fed = f"{pe - fair_pe:+.1f}x" if isinstance(pe, (int, float)) else "N/A"
+
+        surp = d.get("eps_surprise", [])
+        surp_txt = (f"{np.mean([x['surprise_pct'] for x in surp]):+.1f}%（近{len(surp)}季均值）"
+                    if surp else "N/A")
+
+        target, upside = d.get("analyst_target"), "N/A"
+        if target and isinstance(price, (int, float)) and price > 0:
+            upside = f"{(target-price)/price*100:+.1f}%"
+
+        band_txt = f"{band['min']}x–{band['max']}x（均值{band['avg']}x）" if band else "N/A"
+
+        ranked.append((sc["score"], d["symbol"]))
+        rows.append(f"""【{d['symbol']}｜{d.get('name', d['symbol'])}｜{sector}】 現價 ${fp(price,2)}
+- 估值評分：{sc['score']}/100（{sc['signal']}）；爆升前兆綜合 {ss['composite']}/100（毛利{ss['gm_sig']}／EPS{ss['eps_sig']}／FCF{ss['fcf_sig']}／情緒{ss['snt_sig']}）
+- P/E {fp(pe)}x vs 行業 {bench_pe}x vs 5年區間 {band_txt}；Forward P/E {fp(d.get('forward_pe'))}x；P/S {fp(d.get('ps'))}x；PEG {fp(d.get('peg'))}
+- 毛利率 {fpc(d.get('gross_margin'))}｜純利率 {fpc(d.get('profit_margin'))}｜FCF率 {fp(d.get('fcf_yield'))}%｜收入增長 {fpc(d.get('rev_growth'))}｜盈利增長 {fpc(d.get('earnings_growth'))}｜Beta {fp(d.get('beta'))}
+- 安全邊際：{mos_txt}；與利率調整合理P/E差距 {pe_vs_fed}
+- 分析師目標價 ${fp(target)}（空間 {upside}）；EPS 驚喜 {surp_txt}
+- 評分依據：{'；'.join(sc['reasons'][:4]) if sc['reasons'] else '無'}""")
+
+    ranked.sort(reverse=True)
+    avg_score = np.mean([s for s, _ in ranked])
+    temp = "整體合理" if avg_score >= 65 else "整體略貴" if avg_score >= 40 else "整體偏貴"
+    rank_txt = " > ".join(f"{sym}({s})" for s, sym in ranked)
+
+    header = f"""【全分析結果匯總 — {datetime.now().strftime('%Y-%m-%d %H:%M')}】
+市場溫度計：平均估值分 {avg_score:.0f}/100（{temp}）
+估值排名（高→低）：{rank_txt}
+宏觀假設：10年期國債 {rf}% + ERP {erp}% → 利率調整後合理 P/E = {fair_pe}x
+安全邊際假設：要求回報 {req}%/年、EPS 增長 {growth}%/年、持有 {years} 年
+
+""" + "\n\n".join(rows)
+
+    style = {
+        "Claude":  "請以資深分析師＋麵包店老闆的身份，用生動比喻。",
+        "ChatGPT": "請用結構化小標題與表格輸出，所有數字必須對應上方數據。",
+        "Gemini":  "請結合當前宏觀環境（利率、AI 週期）並給出牛／基本／熊三種情境。",
+        "Grok":    "請用最直接的廣東話口語，唔好廢話，直接講結論。",
+    }.get(ai_name, "")
+
+    task = f"""
+
+────────────────────
+你是專業股票分析師。以上是儀表板所有分頁（估值總覽、對比排名、工具箱安全邊際與利率調整、盈利驚喜、爆升前兆）的分析結果。{style}
+請用繁體中文，自動總結並輸出：
+1. 📡 市場總體判斷：整體估值冷熱、利率環境的影響（2-3句）
+2. 🏆 排名表：表格列出每隻股票的【評分／估值判斷／安全邊際折溢價／爆升前兆分／操作建議（買入/持有/等待/減持）】
+3. 🎯 首選與次選：說明理由，並給出具體入場價、12個月目標價、止損價（用美元數字）
+4. ⚠️ 最大風險：點名最需要迴避的股票及原因
+5. 🔗 訊號矛盾：指出哪些股票各項指標互相矛盾（例如估值貴但爆升訊號強），並說明該如何取捨
+6. 📍 一句話總結：現在最該做什麼
+
+請給出明確方向，不要模稜兩可；數據不足的項目請直接標明「數據不足」，不要自行編造。"""
+
+    if compact:
+        # URL 長度有限，壓縮為每股 3 行
+        short_rows = []
+        for r in rows:
+            ls = r.split("\n")
+            short_rows.append("\n".join(ls[:3]))
+        header = header.split("\n\n")[0] + "\n\n" + "\n\n".join(short_rows)
+    return header + task
+
+
+def render_master_summary(stocks_data: list, groq_key: str):
+    """渲染「全分析 AI 總結」區塊：自動生成 Prompt + 一鍵跳轉 + Groq 自動總結。"""
+    valid = [d for d in stocks_data if not d.get("error")]
+    if not valid:
+        st.info("暫無股票數據，請先刷新。")
+        return
+
+    st.markdown('<div class="section-header">全分析 AI 總結</div>', unsafe_allow_html=True)
+    st.markdown("### 🧾 一鍵總結所有分析結果")
+    st.caption("自動整合：估值評分、排名、PE區間、安全邊際、利率調整P/E、盈利驚喜、爆升前兆——數據每次刷新自動更新。")
+
+    # 1) 自動生成 Prompt（隨數據即時更新）
+    ai_choice = st.radio("AI 風格：", ["Claude", "ChatGPT", "Gemini", "Grok"],
+                         horizontal=True, key="master_ai_style")
+    full_prompt = build_master_prompt(stocks_data, ai_choice, compact=False)
+
+    # 2) 一鍵跳轉（URL 過長時自動改用精簡版）
+    AI_CONFIG = [
+        ("Claude",  "🟣", "#7C3AED", "https://claude.ai/new?q={prompt}"),
+        ("ChatGPT", "🟢", "#10A37F", "https://chatgpt.com/?q={prompt}"),
+        ("Gemini",  "🔵", "#1A73E8", "https://gemini.google.com/app?q={prompt}"),
+        ("Grok",    "⚫", "#000000", "https://x.com/i/grok?text={prompt}"),
+    ]
+    cols = st.columns(4)
+    used_compact = False
+    for col, (name, emoji, color, tpl) in zip(cols, AI_CONFIG):
+        with col:
+            p = build_master_prompt(stocks_data, name, compact=False)
+            enc = quote(p, safe="")
+            if len(enc) > 6500:
+                p = build_master_prompt(stocks_data, name, compact=True)
+                enc = quote(p, safe="")
+                used_compact = True
+            st.markdown(
+                f'<a href="{tpl.format(prompt=enc)}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:block;text-align:center;padding:9px 4px;background:{color};'
+                f'color:#fff;border-radius:5px;text-decoration:none;'
+                f'font-family:IBM Plex Mono,monospace;font-size:12px;font-weight:600">'
+                f'{emoji} {name} 總結</a>',
+                unsafe_allow_html=True
+            )
+    if used_compact:
+        st.caption("⚠️ 股票較多，跳轉按鈕已自動使用精簡版 Prompt；完整版請用下方複製框或 Groq 自動總結。")
+
+    # 3) Groq 自動總結（直接在頁面內出結果）
+    st.markdown("---")
+    if groq_key:
+        if st.button("⚡ 用 Groq 自動生成完整總結", key="master_groq_btn", use_container_width=True):
+            with st.spinner("Groq 正在總結所有分析結果..."):
+                st.session_state.groq_summary["master"] = groq_run_prompt(full_prompt, groq_key)
+        if st.session_state.groq_summary.get("master"):
+            st.markdown(
+                f'<div class="bakery-box"><div class="bakery-title">🧾 全分析 AI 總結</div>'
+                f'{st.session_state.groq_summary["master"].replace(chr(10), "<br>")}</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("💡 在側欄輸入 Groq API Key，可直接在此頁自動生成總結（無需跳轉）。")
+
+    # 4) 完整 Prompt 複製框
+    with st.expander("📋 查看 / 複製完整總結 Prompt"):
+        st.code(full_prompt, language=None)
+        st.caption(f"長度約 {len(full_prompt)} 字元")
+
+
 # ── MAIN APP ──────────────────────────────────────────────────────────────────
 def main():
     init_state()
@@ -3280,12 +3462,13 @@ def main():
     """, unsafe_allow_html=True)
 
     # ── TABS ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📊 估值總覽",
         "📈 對比圖表",
         "🧮 工具箱",
         "🥖 麵包店 AI 分析",
-        "🚀 爆升前兆"
+        "🚀 爆升前兆",
+        "🧾 AI 總結"
     ])
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -3494,9 +3677,9 @@ def main():
                 d_mos   = next(d for d in valid_s3 if d["symbol"]==sel_mos)
                 eps_val = d_mos.get("eps", 0)
 
-                req_ret = st.slider("你要求的年回報率 %", 5, 20, 10)
-                growth  = st.slider("預期EPS年增長率 %", 0, 30, 12)
-                years   = st.slider("持有年數", 3, 15, 10)
+                req_ret = st.slider("你要求的年回報率 %", 5, 20, 10, key="mos_req")
+                growth  = st.slider("預期EPS年增長率 %", 0, 30, 12, key="mos_growth")
+                years   = st.slider("持有年數", 3, 15, 10, key="mos_years")
 
                 fair = margin_of_safety(eps_val, req_ret, growth, years)
                 curr = d_mos["price"]
@@ -3522,8 +3705,8 @@ def main():
             st.markdown("#### 🏦 利率環境下的合理 P/E")
             st.caption("當債息高，股票的合理P/E應該更低——因為「安全」回報提高了")
 
-            risk_free = st.slider("10年期國債息率 %", 1.0, 8.0, 4.5, step=0.1)
-            erp       = st.slider("股票風險溢價 ERP %", 2.0, 8.0, 5.0, step=0.5)
+            risk_free = st.slider("10年期國債息率 %", 1.0, 8.0, 4.5, step=0.1, key="rf_slider")
+            erp       = st.slider("股票風險溢價 ERP %", 2.0, 8.0, 5.0, step=0.5, key="erp_slider")
 
             fair_pe = fed_adjusted_pe(risk_free, erp)
             industry_pe_ref = 25.0
@@ -3582,6 +3765,7 @@ def main():
         else:
             st.info("💡 在側欄輸入 Groq API Key 可啟用 AI 分析")
 
+        st.caption("🧾 想一次總結所有分頁的分析結果？請到「AI 總結」分頁。")
         st.markdown("---")
 
         # Market thermometer (repeat here for context)
@@ -3655,6 +3839,12 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     with tab5:
         render_breakout_tab(stocks_data, av_key)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB 6: 全分析 AI 總結
+    # ─────────────────────────────────────────────────────────────────────────
+    with tab6:
+        render_master_summary(stocks_data, groq_key)
 
     # ── AUTO REFRESH ──────────────────────────────────────────────────────────
     if st.session_state.auto_refresh:
